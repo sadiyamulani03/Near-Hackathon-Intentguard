@@ -270,6 +270,11 @@ export default function ScanPage() {
                                   <Badge variant={severityColor(finding.severity)} className="ml-auto text-[10px]">
                                     {finding.severity}
                                   </Badge>
+                                  {finding.ruleId && (
+                                    <span className="ml-2 text-[10px] font-mono text-[#64748b] bg-[#172033] border border-[rgba(148,163,184,0.12)] rounded px-1.5 py-0.5">
+                                      {finding.ruleId}
+                                    </span>
+                                  )}
                                 </div>
                                 <p className="text-sm text-[#94a3b8] leading-relaxed">{finding.description}</p>
                                 {finding.evidence && (
@@ -278,9 +283,22 @@ export default function ScanPage() {
                                     <pre className="text-xs text-[#f8fafc] overflow-x-auto rounded border border-[rgba(148,163,184,0.12)] bg-[#080d18] p-2 break-all">{finding.evidence}</pre>
                                   </div>
                                 )}
-                                <p className="mt-2 text-xs text-[#94a3b8]">
-                                  <span className="font-semibold">Confidence:</span> {finding.confidence}
-                                </p>
+                                <div className="mt-2 flex flex-col sm:flex-row gap-2 text-xs text-[#94a3b8]">
+                                  {finding.line !== undefined && finding.column !== undefined && (
+                                    <span>
+                                      <span className="font-semibold">Location:</span> L{finding.line}:C{finding.column}
+                                    </span>
+                                  )}
+                                  <span>
+                                    <span className="font-semibold">Confidence:</span> {finding.confidence}
+                                  </span>
+                                </div>
+                                {finding.proof && (
+                                  <div className="mt-1.5">
+                                    <p className="text-xs font-semibold text-[#94a3b8] uppercase tracking-wider mb-1">Why this matched</p>
+                                    <p className="text-xs text-[#64748b] leading-relaxed">{finding.proof}</p>
+                                  </div>
+                                )}
                                 {finding.recommendation && (
                                   <div className="mt-2">
                                     <p className="text-xs font-semibold text-[#94a3b8] uppercase tracking-wider mb-1">Recommendation</p>
@@ -295,7 +313,7 @@ export default function ScanPage() {
                     </div>
                   ) : (
                     <div className="rounded-lg border border-[rgba(148,163,184,0.12)] bg-[#111827] p-5">
-                      <p className="text-sm text-[#94a3b8]">No security findings detected in the submitted source code.</p>
+                      <p className="text-sm text-[#94a3b8]">No security patterns detected by static analysis. This does not guarantee the contract is secure.</p>
                     </div>
                   )}
 
@@ -322,6 +340,11 @@ export default function ScanPage() {
                   )}
 
                   <p className="text-xs text-[#64748b] italic">{analysis.disclaimer}</p>
+                  {analysis.engine && analysis.engine !== "ai" && (
+                    <p className="text-xs text-[#64748b] italic mt-1">
+                      Analysis engine: {analysis.engine === "static" ? "Deterministic static analysis (no AI credits required)" : "Hybrid (static analysis + AI)"}.
+                    </p>
+                  )}
                 </div>
               )}
 

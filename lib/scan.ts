@@ -1,7 +1,12 @@
 import OpenAI, { type OpenAI as OpenAIClient } from "openai";
+import {
+  analyzeStatically,
+  type StaticFinding,
+} from "./static-analysis";
 
 export type AiSeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
 export type AiRiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" | "INSUFFICIENT_DATA";
+export type AnalysisEngine = "ai" | "static" | "hybrid";
 
 export interface AiFinding {
   title: string;
@@ -10,6 +15,10 @@ export interface AiFinding {
   evidence?: string;
   recommendation?: string;
   confidence: "LOW" | "MEDIUM" | "HIGH";
+  ruleId?: string;
+  line?: number;
+  column?: number;
+  proof?: string;
 }
 
 export interface AiAnalysis {
@@ -19,6 +28,7 @@ export interface AiAnalysis {
   positiveSignals: string[];
   limitations: string[];
   disclaimer: string;
+  engine?: AnalysisEngine;
 }
 
 export interface ScanError {
@@ -231,6 +241,21 @@ export interface AnalyzeContractOptions {
   client?: OpenAIClient;
 }
 
+function staticFindingToAiFinding(f: StaticFinding): AiFinding {
+  return {
+    title: f.title,
+    severity: f.severity,
+    description: f.description,
+    evidence: f.evidence,
+    recommendation: f.recommendation,
+    confidence: f.confidence,
+    ruleId: f.ruleId,
+    line: f.location.line,
+    column: f.location.column,
+    proof: f.proof,
+  };
+}
+
 export async function analyzeContract(
   sourceCode: string,
   options: AnalyzeContractOptions = {}
@@ -240,116 +265,139 @@ export async function analyzeContract(
     return { ok: false, error: validation.error };
   }
 
-  let client: OpenAIClient;
-  if (options.client) {
-    client = options.client;
-  } else {
-    try {
-      client = getOpenAIClient();
-    } catch (err) {
-      return { ok: false, error: err as ScanError };
-    }
-  }
+  // Always run deterministic static analysis first
+  const staticResult = analyzeStatically(validation.value);
+  const staticFindings = staticResult.findings.map(staticFindingToAiFinding);
 
-  const prompt = buildAnalysisPrompt(validation.value);
+  const staticDisclaimer =
+    "Deterministic static-analysis results. These findings are code patterns detected by static analysis, not confirmed vulnerabilities. Manual review is recommended.";
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  const combinedSignal = options.signal
-    ? (() => {
-        const ac = new AbortController();
-        options.signal.addEventListener("abort", () => ac.abort());
-        controller.signal.addEventListener("abort", () => ac.abort());
-        return ac.signal;
-      })()
-    : controller.signal;
+  // Try AI analysis
+  let aiAnalysis: AiAnalysis | null = null;
 
+  let client: OpenAIClient | null = null;
   try {
-    const response = await client.chat.completions.create(
-      {
-        model: NEAR_AI_MODEL,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.2,
-        max_tokens: 2048,
-      },
-      { signal: combinedSignal }
-    );
-
-    const content = response.choices?.[0]?.message?.content;
-    if (!content || typeof content !== "string") {
-      return { ok: false, error: makeError("MALFORMED_OUTPUT", "Model returned no analyzable content.", 502) };
+    if (options.client) {
+      client = options.client;
+    } else {
+      client = getOpenAIClient();
     }
-
-    let parsed: unknown;
-    try {
-      parsed = extractJson(content);
-    } catch {
-      return { ok: false, error: makeError("MALFORMED_OUTPUT", "Model returned malformed JSON output.", 502) };
-    }
-
-    let analysis: AiAnalysis;
-    try {
-      analysis = validateAiOutput(parsed);
-    } catch {
-      return { ok: false, error: makeError("MALFORMED_OUTPUT", "Model output failed schema validation.", 502) };
-    }
-
-    return { ok: true, analysis };
-  } catch (err: unknown) {
-    clearTimeout(timeoutId);
-    if (err instanceof Error && err.name === "AbortError") {
-      return { ok: false, error: makeError("PROVIDER_FAILURE", "AI analysis request timed out.", 504) };
-    }
-
-    // Extract provider HTTP status code if available (OpenAI SDK APIError)
-    const providerStatus = (err as { status?: number })?.status;
-    const providerMessage = err instanceof Error ? err.message : String(err);
-
-    // Sanitized server-side diagnostics (never logs keys or source code)
-    console.error(
-      `[IntentGuard scan] Provider request failed: status=${providerStatus ?? "unknown"} message=${providerMessage.replace(
-        /[A-Za-z0-9]{32,}/g,
-        "[REDACTED]"
-      )}`
-    );
-
-    // Map provider-specific HTTP errors to honest client messages
-    if (providerStatus === 401) {
-      return {
-        ok: false,
-        error: makeError("NOT_CONFIGURED", "AI analysis service authentication failed.", 500),
-      };
-    }
-    if (providerStatus === 402) {
-      return {
-        ok: false,
-        error: makeError(
-          "PROVIDER_FAILURE",
-          "AI analysis service has no spending credits configured. Please contact support.",
-          502
-        ),
-      };
-    }
-    if (providerStatus === 429) {
-      return {
-        ok: false,
-        error: makeError("PROVIDER_FAILURE", "AI analysis service rate limit exceeded. Please retry shortly.", 502),
-      };
-    }
-    if (providerStatus && providerStatus >= 400 && providerStatus < 500) {
-      return {
-        ok: false,
-        error: makeError(
-          "PROVIDER_FAILURE",
-          `AI analysis request was rejected (${providerStatus}). Please check your input and retry.`,
-          502
-        ),
-      };
-    }
-
-    // Never leak internal stack traces or provider details to the client
-    return { ok: false, error: makeError("PROVIDER_FAILURE", "AI analysis service failed. Please retry.", 502) };
-  } finally {
-    clearTimeout(timeoutId);
+  } catch {
+    // AI not configured; fall through to static-only result
   }
+
+  if (client) {
+    const prompt = buildAnalysisPrompt(validation.value);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const combinedSignal = options.signal
+      ? (() => {
+          const ac = new AbortController();
+          options.signal.addEventListener("abort", () => ac.abort());
+          controller.signal.addEventListener("abort", () => ac.abort());
+          return ac.signal;
+        })()
+      : controller.signal;
+
+    try {
+      const response = await client.chat.completions.create(
+        {
+          model: NEAR_AI_MODEL,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.2,
+          max_tokens: 2048,
+        },
+        { signal: combinedSignal }
+      );
+      clearTimeout(timeoutId);
+
+      const content = response.choices?.[0]?.message?.content;
+      if (content && typeof content === "string") {
+        let parsed: unknown;
+        try {
+          parsed = extractJson(content);
+        } catch {
+          // AI returned malformed output; fall through to static-only
+        }
+
+        if (parsed) {
+          let parsedAnalysis: AiAnalysis | null = null;
+          try {
+            parsedAnalysis = validateAiOutput(parsed);
+          } catch {
+            // AI output failed schema validation; fall through to static-only
+          }
+
+          if (parsedAnalysis) {
+            aiAnalysis = parsedAnalysis;
+          }
+        }
+      }
+    }
+    catch {
+      clearTimeout(timeoutId);
+      // AI request failed; fall through to static-only result
+    }
+  }
+
+  // Build final result
+  if (aiAnalysis) {
+    // Merge AI and static findings, deduplicating by ruleId + line + title
+    const mergedFindings = [...aiAnalysis.findings];
+    for (const sf of staticFindings) {
+      const duplicate = mergedFindings.find(
+        (af) =>
+          af.ruleId === sf.ruleId && af.line === sf.line && af.title === sf.title
+      );
+      if (!duplicate) {
+        mergedFindings.push(sf);
+      }
+    }
+
+    const allLimitations = Array.from(
+      new Set([...aiAnalysis.limitations, ...staticResult.limitations])
+    );
+    const allPositiveSignals = Array.from(
+      new Set([...aiAnalysis.positiveSignals, ...staticResult.positiveSignals])
+    );
+
+    const riskRank: Record<AiRiskLevel, number> = {
+      LOW: 0,
+      MEDIUM: 1,
+      HIGH: 2,
+      CRITICAL: 3,
+      INSUFFICIENT_DATA: 0,
+    };
+    const aiRank = riskRank[aiAnalysis.riskLevel];
+    const staticRank = riskRank[staticResult.riskLevel];
+    const combinedRisk = aiRank >= staticRank ? aiAnalysis.riskLevel : staticResult.riskLevel;
+
+    return {
+      ok: true,
+      analysis: {
+        riskLevel: combinedRisk,
+        summary: aiAnalysis.summary,
+        findings: mergedFindings,
+        positiveSignals: allPositiveSignals,
+        limitations: allLimitations,
+        disclaimer: aiAnalysis.disclaimer,
+        engine: "hybrid",
+      },
+    };
+  }
+
+  // AI unavailable or failed — return static results only
+  return {
+    ok: true,
+    analysis: {
+      riskLevel: staticResult.riskLevel,
+      summary: staticResult.summary,
+      findings: staticFindings,
+      positiveSignals: staticResult.positiveSignals,
+      limitations: [...staticResult.limitations, staticDisclaimer],
+      disclaimer: staticDisclaimer,
+      engine: "static",
+    },
+  };
 }

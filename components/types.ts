@@ -34,6 +34,10 @@ export interface AnalysisFinding {
   evidence?: string;
   recommendation?: string;
   confidence: "LOW" | "MEDIUM" | "HIGH";
+  ruleId?: string;
+  line?: number;
+  column?: number;
+  proof?: string;
 }
 
 export interface ApiAnalysis {
@@ -43,6 +47,7 @@ export interface ApiAnalysis {
   positiveSignals: string[];
   limitations: string[];
   disclaimer: string;
+  engine?: "ai" | "static" | "hybrid";
 }
 
 export function mapApiRiskToFrontend(riskLevel: ApiAnalysis["riskLevel"]): RiskLevel {

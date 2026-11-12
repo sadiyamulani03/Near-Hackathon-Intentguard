@@ -80,41 +80,38 @@ describe("severity/risk validators", () => {
 });
 
 describe("analyzeContract", () => {
-  it("returns NOT_CONFIGURED when NEAR_AI_KEY is missing and no client injected", async () => {
+  it("returns static results when NEAR_AI_KEY is missing (no AI)", async () => {
     const r = await analyzeContract(validSource);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error.code).toBe("NOT_CONFIGURED");
-  });
-
-  it("returns EMPTY_INPUT for empty source", async () => {
-    process.env.NEAR_AI_KEY = "test-key";
-    const r = await analyzeContract("");
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error.code).toBe("EMPTY_INPUT");
-  });
-
-  it("returns provider failure when the AI API throws", async () => {
-    process.env.NEAR_AI_KEY = "test-key";
-    mockCreate.mockRejectedValue(new Error("upstream down"));
-    const r = await analyzeContract(validSource, { client: makeTypedClient() });
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.error.code).toBe("PROVIDER_FAILURE");
-      expect(r.error.statusCode).toBe(502);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.analysis.engine).toBe("static");
+      expect(r.analysis.findings.length).toBeGreaterThanOrEqual(0);
     }
   });
 
-  it("returns malformed output when JSON is invalid", async () => {
+  it("returns static results when AI API throws", async () => {
+    process.env.NEAR_AI_KEY = "test-key";
+    mockCreate.mockRejectedValue(new Error("upstream down"));
+    const r = await analyzeContract(validSource, { client: makeTypedClient() });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.analysis.engine).toBe("static");
+    }
+  });
+
+  it("returns static results when AI returns malformed output", async () => {
     process.env.NEAR_AI_KEY = "test-key";
     mockCreate.mockResolvedValue({
       choices: [{ message: { content: "not json at all" } }],
     });
     const r = await analyzeContract(validSource, { client: makeTypedClient() });
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error.code).toBe("MALFORMED_OUTPUT");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.analysis.engine).toBe("static");
+    }
   });
 
-  it("returns valid analysis for well-formed model output", async () => {
+  it("returns hybrid results when AI succeeds with valid output", async () => {
     process.env.NEAR_AI_KEY = "test-key";
     mockCreate.mockResolvedValue({
       choices: [{ message: { content: JSON.stringify({
@@ -138,9 +135,42 @@ describe("analyzeContract", () => {
     const r = await analyzeContract(validSource, { client: makeTypedClient() });
     expect(r.ok).toBe(true);
     if (r.ok) {
+      expect(r.analysis.engine).toBe("hybrid");
       expect(r.analysis.riskLevel).toBe("HIGH");
-      expect(r.analysis.findings).toHaveLength(1);
       expect(r.analysis.findings[0].title).toBe("Reentrancy");
     }
+  });
+
+  it("includes static findings with ruleId, line, column, and proof", async () => {
+    const reentrancySource = `
+contract VulnerableVault {
+  mapping(address => uint256) public balances;
+  function withdraw(uint256 amount) public {
+    msg.sender.call("");
+    balances[msg.sender] = balances[msg.sender] - amount;
+  }
+}
+`;
+    const r = await analyzeContract(reentrancySource);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const reentrancyFinding = r.analysis.findings.find((f) => f.ruleId === "REENTRANCY-01");
+      expect(reentrancyFinding).toBeDefined();
+      if (reentrancyFinding) {
+        expect(reentrancyFinding.ruleId).toBe("REENTRANCY-01");
+        expect(reentrancyFinding.line).toBeGreaterThan(0);
+        expect(reentrancyFinding.column).toBeGreaterThanOrEqual(0);
+        expect(reentrancyFinding.proof).toBeDefined();
+        expect(reentrancyFinding.evidence).toBeDefined();
+        expect(reentrancyFinding.recommendation).toBeDefined();
+      }
+    }
+  });
+
+  it("returns EMPTY_INPUT for empty source", async () => {
+    process.env.NEAR_AI_KEY = "test-key";
+    const r = await analyzeContract("");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("EMPTY_INPUT");
   });
 });

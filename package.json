@@ -14,7 +14,8 @@
     "next": "16.4.6",
     "openai": "^7.55.0",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "solidity-parser-antlr": "^0.4.11"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "4.3.3",
