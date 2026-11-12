@@ -10,6 +10,10 @@ import {
   type Identifier,
   type BinaryOperation,
   type Location,
+  type ExpressionStatement,
+  type IfStatement,
+  type EmitStatement,
+  type VariableDeclarationStatement,
 } from "solidity-parser-antlr";
 
 export type RuleId =
@@ -46,6 +50,17 @@ export interface StaticAnalysisResult {
 
 const MAX_SOURCE_CHARS = 64 * 1024;
 
+const REENTRANCY_GUARD_NAMES = new Set([
+  "nonReentrant",
+  "ReentrancyGuard",
+  "onlyOwner",
+  "onlyAdmin",
+  "onlyGovernance",
+  "onlyRole",
+  "authorized",
+  "ownerOnly",
+]);
+
 function getLoc(node: { loc?: Location }): SourceLocation | null {
   if (!node.loc) return null;
   return { line: node.loc.start.line, column: node.loc.start.column };
@@ -54,7 +69,6 @@ function getLoc(node: { loc?: Location }): SourceLocation | null {
 function getSnippet(source: string, node: { range?: [number, number] }): string {
   if (!node.range) return "";
   const [start, end] = node.range;
-  // Extend range slightly to capture full token text
   const s = Math.max(0, start - 1);
   const e = Math.min(source.length, end + 1);
   return source.slice(s, e);
@@ -99,6 +113,46 @@ function isBinaryOperation(node: unknown, operator?: string): node is BinaryOper
   );
 }
 
+function isExpressionStatement(node: unknown): node is ExpressionStatement {
+  return (
+    typeof node === "object" &&
+    node !== null &&
+    (node as { type?: string }).type === "ExpressionStatement"
+  );
+}
+
+function isIfStatement(node: unknown): node is IfStatement {
+  return (
+    typeof node === "object" &&
+    node !== null &&
+    (node as { type?: string }).type === "IfStatement"
+  );
+}
+
+function isEmitStatement(node: unknown): node is EmitStatement {
+  return (
+    typeof node === "object" &&
+    node !== null &&
+    (node as { type?: string }).type === "EmitStatement"
+  );
+}
+
+function isVariableDeclarationStatement(node: unknown): node is VariableDeclarationStatement {
+  return (
+    typeof node === "object" &&
+    node !== null &&
+    (node as { type?: string }).type === "VariableDeclarationStatement"
+  );
+}
+
+function isUnaryOperation(node: unknown): boolean {
+  return (
+    typeof node === "object" &&
+    node !== null &&
+    (node as { type?: string }).type === "UnaryOperation"
+  );
+}
+
 function collectChildren(node: unknown): ASTNode[] {
   const result: ASTNode[] = [];
   if (!node || typeof node !== "object") return result;
@@ -140,6 +194,14 @@ function getFunctionModifiers(fn: FunctionDefinition): string[] {
   return (fn.modifiers || []).map((m) => (m as ModifierInvocation).name);
 }
 
+function hasReentrancyGuard(fn: FunctionDefinition): boolean {
+  const modifiers = getFunctionModifiers(fn);
+  for (const m of modifiers) {
+    if (REENTRANCY_GUARD_NAMES.has(m)) return true;
+  }
+  return false;
+}
+
 function isExternalCall(node: unknown): boolean {
   if (!isFunctionCall(node)) return false;
   const fc = node as FunctionCall;
@@ -158,8 +220,14 @@ function getLowLevelCallName(node: unknown): string | null {
   if (!isFunctionCall(node)) return null;
   const fc = node as FunctionCall;
   const expr = fc.expression;
-  if (isMemberAccess(expr, "call") || isMemberAccess(expr, "delegatecall") || isMemberAccess(expr, "staticcall")) {
-    return expr.memberName;
+  if (
+    isMemberAccess(expr, "call") ||
+    isMemberAccess(expr, "delegatecall") ||
+    isMemberAccess(expr, "staticcall") ||
+    isMemberAccess(expr, "send") ||
+    isMemberAccess(expr, "transfer")
+  ) {
+    return (expr as MemberAccess).memberName;
   }
   return null;
 }
@@ -178,30 +246,68 @@ function findExternalCallsInBlock(block: unknown): Array<{ node: ASTNode; name: 
   return results;
 }
 
+function isStateVariableAssignment(left: unknown, stateVars: Set<string>): boolean {
+  if (!left || typeof left !== "object") return false;
+  // Direct identifier: x = ...
+  if (isIdentifier(left)) {
+    const name = (left as Identifier).name;
+    if (name && stateVars.has(name)) return true;
+  }
+  // IndexAccess: balances[msg.sender] = ...
+  if ((left as { type?: string }).type === "IndexAccess") {
+    const idx = left as { base?: unknown };
+    const baseName = getIdentifierName(idx.base);
+    if (baseName && stateVars.has(baseName)) return true;
+  }
+  return false;
+}
+
 function findStateUpdatesInBlock(
   block: unknown,
   stateVars: Set<string>,
-): Array<{ node: ASTNode; varName: string; loc: SourceLocation | null }> {
-  const results: Array<{ node: ASTNode; varName: string; loc: SourceLocation | null }> = [];
+): Array<{ node: ASTNode; varName: string; loc: SourceLocation | null; op: string }> {
+  const results: Array<{ node: ASTNode; varName: string; loc: SourceLocation | null; op: string }> = [];
   if (!block || typeof block !== "object") return results;
   const all = walkAll(block as ASTNode);
   for (const node of all) {
-    if (node.type !== "ExpressionStatement") continue;
-    const es = node as { expression: unknown };
-    if (!isBinaryOperation(es.expression)) continue;
-    const bin = es.expression as BinaryOperation;
-    const left = bin.left;
-    const leftName = getIdentifierName(left);
-    if (leftName && stateVars.has(leftName)) {
-      results.push({ node, varName: leftName, loc: getLoc(node) });
-      continue;
+    if (isExpressionStatement(node)) {
+      const es = node as ExpressionStatement;
+      if (isBinaryOperation(es.expression)) {
+        const bin = es.expression as BinaryOperation;
+        const left = bin.left;
+        if (isStateVariableAssignment(left, stateVars)) {
+          const varName = isIdentifier(left)
+            ? (left as Identifier).name!
+            : getIdentifierName((left as { base?: unknown }).base!)!;
+          results.push({ node, varName, loc: getLoc(node), op: bin.operator });
+          continue;
+        }
+      }
+      // Unary operations: count++, count--
+      if (isUnaryOperation(es.expression)) {
+        const uni = es.expression as { argument?: unknown; operator?: string };
+        const arg = uni.argument;
+        if (isStateVariableAssignment(arg, stateVars)) {
+          const varName = isIdentifier(arg)
+            ? (arg as Identifier).name!
+            : getIdentifierName((arg as { base?: unknown }).base!)!;
+          results.push({ node, varName, loc: getLoc(node), op: uni.operator ?? "++/--" });
+          continue;
+        }
+      }
     }
-    // Handle IndexAccess on left side (e.g., balances[msg.sender] -= amount)
-    if (left && typeof left === "object" && (left as { type?: string }).type === "IndexAccess") {
-      const idx = left as { base?: unknown };
-      const baseName = getIdentifierName(idx.base);
-      if (baseName && stateVars.has(baseName)) {
-        results.push({ node, varName: baseName, loc: getLoc(node) });
+    // VariableDeclarationStatement with delete: delete count
+    if (isVariableDeclarationStatement(node)) {
+      const vds = node as VariableDeclarationStatement;
+      // Check for delete statement pattern
+      if (vds.initialValue === undefined) {
+        for (const v of vds.variables) {
+          const vd = v as { name?: string };
+          const name = vd.name;
+          if (name && stateVars.has(name)) {
+            results.push({ node, varName: name, loc: getLoc(node), op: "delete" });
+          }
+        }
       }
     }
   }
@@ -250,12 +356,37 @@ function findSelfdestruct(node: unknown): Array<{ node: ASTNode; loc: SourceLoca
   return results;
 }
 
-function isResultChecked(callNode: FunctionCall, allNodes: ASTNode[]): boolean {
-  for (const n of allNodes) {
+function nodeContainsCall(node: unknown, callNode: FunctionCall): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (node === callNode) return true;
+  const obj = node as Record<string, unknown>;
+  for (const [, value] of Object.entries(obj)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (nodeContainsCall(item, callNode)) return true;
+      }
+    } else if (value && typeof value === "object") {
+      if (nodeContainsCall(value, callNode)) return true;
+    }
+  }
+  return false;
+}
+
+function isResultChecked(callNode: FunctionCall, fnBody: unknown): boolean {
+  if (!fnBody || typeof fnBody !== "object") return false;
+  const all = walkAll(fnBody as ASTNode);
+  for (const n of all) {
+    // Pattern 1: assignment - bool success = target.call(...) or x = target.call(...)
     if (n.type === "BinaryOperation" && n.operator === "=") {
       const bin = n as BinaryOperation;
       if (bin.right === callNode) return true;
     }
+    // Pattern 2: variable declaration with initializer - bool success = target.call(...)
+    if (n.type === "VariableDeclarationStatement") {
+      const vds = n as { initialValue?: unknown };
+      if (vds.initialValue === callNode) return true;
+    }
+    // Pattern 3: require(target.call(...), "msg")
     if (n.type === "FunctionCall") {
       const fc = n as FunctionCall;
       const expr = fc.expression;
@@ -264,6 +395,16 @@ function isResultChecked(callNode: FunctionCall, allNodes: ASTNode[]): boolean {
           if (arg === callNode) return true;
         }
       }
+    }
+    // Pattern 4: if (target.call(...)) { ... }
+    if (n.type === "IfStatement") {
+      const iff = n as { condition?: unknown };
+      if (iff.condition && nodeContainsCall(iff.condition, callNode)) return true;
+    }
+    // Pattern 5: while / for condition containing the call
+    if (n.type === "WhileStatement" || n.type === "ForStatement") {
+      const loop = n as { conditionExpression?: unknown };
+      if (loop.conditionExpression && nodeContainsCall(loop.conditionExpression, callNode)) return true;
     }
   }
   return false;
@@ -276,6 +417,78 @@ function hasAccessControlGuard(fn: FunctionDefinition): boolean {
     if (guardNames.has(m)) return true;
   }
   return false;
+}
+
+function isTxOriginInAuthorizationContext(
+  originNode: ASTNode,
+  fnBody: unknown,
+): boolean {
+  if (!fnBody || typeof fnBody !== "object") return false;
+  const all = walkAll(fnBody as ASTNode);
+
+  // Find all EmitStatements - tx.origin inside emit is informational, not authorization
+  const emitStatements = all.filter((n) => isEmitStatement(n));
+  for (const emit of emitStatements) {
+    if (nodeContainsCall(emit as ASTNode, originNode as unknown as FunctionCall)) {
+      // Actually we need to check if originNode is contained in emit, not if emit contains a FunctionCall
+      // Let's use a different approach: check if originNode is a descendant of emit
+      if (isNodeDescendantOf(originNode, emit)) {
+        return false; // informational, not authorization
+      }
+    }
+  }
+
+  // Check if originNode is inside a require() call
+  for (const n of all) {
+    if (n.type === "FunctionCall") {
+      const fc = n as FunctionCall;
+      const expr = fc.expression;
+      if (expr && typeof expr === "object" && getIdentifierName(expr) === "require") {
+        for (const arg of fc.arguments) {
+          if (isNodeDescendantOf(originNode, arg)) {
+            return true; // authorization
+          }
+        }
+      }
+    }
+  }
+
+  // Check if originNode is inside an if() condition
+  for (const n of all) {
+    if (isIfStatement(n)) {
+      const iff = n as IfStatement;
+      if (iff.condition && isNodeDescendantOf(originNode, iff.condition)) {
+        return true; // authorization
+      }
+    }
+  }
+
+  // Check if originNode is part of tx.origin == msg.sender comparison
+  for (const n of all) {
+    if (isBinaryOperation(n, "==") || isBinaryOperation(n, "!=")) {
+      const bin = n as BinaryOperation;
+      const leftName = getIdentifierName(bin.left);
+      const rightName = getIdentifierName(bin.right);
+      // Check if one side is tx.origin and other is msg.sender
+      if (
+        (leftName === "tx" && rightName === "msg") ||
+        (rightName === "tx" && leftName === "msg")
+      ) {
+        // Need to verify it's actually tx.origin, not just tx and msg as identifiers
+        if (isNodeDescendantOf(originNode, n)) {
+          return true; // authorization comparison
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+function isNodeDescendantOf(node: ASTNode, ancestor: ASTNode): boolean {
+  // Walk from ancestor and check if node is found among its descendants
+  const descendants = walkAll(ancestor);
+  return descendants.includes(node);
 }
 
 export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
@@ -323,11 +536,14 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
   }
 
   if (usedTolerantParse) {
+    limitations.push(
+      "Parser used tolerant mode: some modern Solidity syntax may not have been fully analyzed. Results may be incomplete.",
+    );
     return {
       findings: [],
       riskLevel: "INSUFFICIENT_DATA",
-      summary: "Source code contains syntax errors. Static analysis may be incomplete.",
-      limitations: ["Source code was only partially parsed due to syntax errors."],
+      summary: "Source code contains syntax errors or uses unsupported syntax. Static analysis may be incomplete.",
+      limitations,
       positiveSignals: [],
     };
   }
@@ -347,7 +563,6 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
 
   const allFunctions = findFunctions(ast);
 
-  // If there are contracts but no functions, the source may be malformed
   if (allFunctions.length === 0 && contracts.length > 0) {
     return {
       findings: [],
@@ -373,7 +588,6 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
     );
 
     const contractFunctions = walkAll(contract).filter((n) => n.type === "FunctionDefinition") as FunctionDefinition[];
-    const allNodesInContract = walkAll(contract);
 
     for (const fn of contractFunctions) {
       const modifiers = getFunctionModifiers(fn);
@@ -383,6 +597,7 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
       if (fnBody) {
         const externalCalls = findExternalCallsInBlock(fnBody);
         const stateUpdates = findStateUpdatesInBlock(fnBody, contractStateVars);
+        const hasGuard = hasReentrancyGuard(fn);
 
         for (const call of externalCalls) {
           const callLine = call.loc?.line ?? 0;
@@ -392,18 +607,23 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
             const callName = call.name;
             const varName = updateAfterCall.varName;
             const snippet = getSnippet(sourceCode, call.node);
+            const guardAdjusted = hasGuard;
             findings.push({
               ruleId: "REENTRANCY-01",
-              title: "Potential Reentrancy: External Call Before State Update",
-              severity: "HIGH",
-              confidence: "MEDIUM",
+              title: guardAdjusted
+                ? "Potential Reentrancy: External Call Before State Update (mitigated by guard)"
+                : "Potential Reentrancy: External Call Before State Update",
+              severity: guardAdjusted ? "MEDIUM" : "HIGH",
+              confidence: guardAdjusted ? "LOW" : "MEDIUM",
               description:
                 `An external call (${callName}) is made before a state variable (${varName}) is updated in the same function. This violates the checks-effects-interactions pattern and may allow reentrancy attacks if the external call invokes an untrusted contract.`,
               evidence: snippet,
               recommendation:
                 "Reorder operations so that all state updates occur before external calls. Use the checks-effects-interactions pattern: validate inputs, update state, then interact with external contracts. Consider using ReentrancyGuard from OpenZeppelin.",
               location: call.loc ?? { line: 0, column: 0 },
-              proof: `External call "${callName}" at line ${call.loc?.line ?? "?"} precedes state update to "${varName}" at line ${updateAfterCall.loc?.line ?? "?"} in function "${fn.name ?? "unknown"}".`,
+              proof: guardAdjusted
+                ? `External call "${callName}" at line ${call.loc?.line ?? "?"} precedes state update to "${varName}" at line ${updateAfterCall.loc?.line ?? "?"} in function "${fn.name ?? "unknown"}". Function has reentrancy guard "${modifiers.join(", ")}", which may mitigate but does not eliminate the risk.`
+                : `External call "${callName}" at line ${call.loc?.line ?? "?"} precedes state update to "${varName}" at line ${updateAfterCall.loc?.line ?? "?"} in function "${fn.name ?? "unknown"}".`,
             });
           }
         }
@@ -413,6 +633,9 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
       if (fnBody) {
         const origins = findTxOriginUsages(fnBody);
         for (const origin of origins) {
+          const isAuth = isTxOriginInAuthorizationContext(origin.node, fnBody);
+          if (!isAuth) continue; // Skip informational uses (events, logging, etc.)
+
           const snippet = getSnippet(sourceCode, origin.node);
           findings.push({
             ruleId: "TX_ORIGIN-01",
@@ -425,7 +648,7 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
             recommendation:
               "Replace tx.origin with msg.sender for authorization checks. msg.sender refers to the immediate caller and is the correct identity to use for access control. Only use tx.origin when you specifically need the original transaction initiator (rare).",
             location: origin.loc ?? { line: 0, column: 0 },
-            proof: `tx.origin referenced at line ${origin.loc?.line ?? "?"} in function "${fn.name ?? "unknown"}".`,
+            proof: `tx.origin referenced in authorization context at line ${origin.loc?.line ?? "?"} in function "${fn.name ?? "unknown"}".`,
           });
         }
       }
@@ -435,7 +658,7 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
         const lowLevelCalls = findLowLevelCalls(fnBody);
         for (const lc of lowLevelCalls) {
           if (lc.name === "delegatecall") continue; // handled by rule D
-          const isChecked = isResultChecked(lc.node as FunctionCall, allNodesInContract);
+          const isChecked = isResultChecked(lc.node as FunctionCall, fnBody);
           if (!isChecked) {
             const snippet = getSnippet(sourceCode, lc.node);
             findings.push({
@@ -460,18 +683,23 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
         const delegatecalls = findLowLevelCalls(fnBody).filter((c) => c.name === "delegatecall");
         for (const dc of delegatecalls) {
           const snippet = getSnippet(sourceCode, dc.node);
+          const isUserControlled = isDelegatecallTargetUserControlled(dc.node as FunctionCall, fnBody);
           findings.push({
             ruleId: "DELEGATECALL-01",
-            title: "Potentially Unsafe delegatecall",
-            severity: "MEDIUM",
-            confidence: "MEDIUM",
+            title: isUserControlled
+              ? "Potentially Unsafe delegatecall with User-Controlled Target"
+              : "Potentially Unsafe delegatecall with Fixed Target",
+            severity: isUserControlled ? "HIGH" : "MEDIUM",
+            confidence: isUserControlled ? "HIGH" : "MEDIUM",
             description:
-              "delegatecall executes code from another contract in the context of the current contract, using the current contract's storage and msg.sender. If the target address is user-controlled or points to an untrusted contract, it can lead to complete contract compromise, including storage overwrites and fund theft.",
+              "delegatecall executes code from another contract in the context of the current contract, using the current contract's storage and msg.sender. If the target address is user-controlled or points to an untrusted contract, it can lead to complete contract compromise, including storage overwrites and fund theft. Even fixed targets should be audited carefully, as the target contract's code may be upgradeable or malicious.",
             evidence: snippet,
             recommendation:
-              "Avoid delegatecall with user-controlled addresses. If delegatecall is necessary, restrict the target address to a whitelisted, immutable contract. Consider using libraries with explicit function signatures instead of delegatecall where possible.",
+              "Avoid delegatecall with user-controlled addresses. If delegatecall is necessary, restrict the target address to a whitelisted, immutable contract. Consider using libraries with explicit function signatures instead of delegatecall where possible. Audit the target contract thoroughly even if the address is fixed.",
             location: dc.loc ?? { line: 0, column: 0 },
-            proof: `delegatecall at line ${dc.loc?.line ?? "?"} in function "${fn.name ?? "unknown"}".`,
+            proof: isUserControlled
+              ? `delegatecall at line ${dc.loc?.line ?? "?"} in function "${fn.name ?? "unknown"}" with user-controlled target address.`
+              : `delegatecall at line ${dc.loc?.line ?? "?"} in function "${fn.name ?? "unknown"}" with fixed target address. Fixed targets still require audit of the target contract code.`,
           });
         }
       }
@@ -538,6 +766,34 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
   );
 
   return { findings, riskLevel, summary, limitations, positiveSignals };
+}
+
+function isDelegatecallTargetUserControlled(
+  callNode: FunctionCall,
+  fnBody: unknown,
+): boolean {
+  const fc = callNode as FunctionCall;
+  const expr = fc.expression;
+  if (!isMemberAccess(expr, "delegatecall")) return false;
+
+  const base = expr.expression;
+  if (!base) return true; // No base expression, treat as user-controlled
+
+  // If base is a function parameter (e.g., address target), it's user-controlled
+  if (isIdentifier(base)) {
+    const baseName = (base as Identifier).name;
+    if (!baseName) return true;
+    // Check if baseName matches a function parameter name
+    const params = walkAll(fnBody as ASTNode).filter(
+      (n) => n.type === "VariableDeclaration" && (n as { name?: string }).name === baseName
+    );
+    if (params.length > 0) return true;
+  }
+
+  // Base is not a function parameter. It may be a state variable, constant,
+  // or other expression. We cannot be certain it is safe, so flag it but
+  // with adjusted severity. Return false to indicate "not clearly user-controlled."
+  return false;
 }
 
 export function validateSourceSize(sourceCode: unknown): { ok: true; value: string } | { ok: false; error: { code: string; message: string; statusCode: number } } {
