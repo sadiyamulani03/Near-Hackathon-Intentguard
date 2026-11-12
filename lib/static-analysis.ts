@@ -50,6 +50,32 @@ export interface StaticAnalysisResult {
 
 const MAX_SOURCE_CHARS = 64 * 1024;
 
+function preprocessCallOptions(source: string): string {
+  // Convert Solidity call options syntax .call{OPTIONS}(ARGS) to parseable .call.value(X).gas(Y)(ARGS)
+  // Handles: .call{value: amount}(data), .call{gas: limit}(data), .call{value: amount, gas: limit}(data)
+  return source.replace(
+    /\.call\s*\{([^}]*)\}\s*\(/g,
+    (_match, optionsStr) => {
+      const options = optionsStr.split(",").map((o: string) => o.trim());
+      let valueArg: string | null = null;
+      let gasArg: string | null = null;
+      for (const opt of options) {
+        const colonIdx = opt.indexOf(":");
+        if (colonIdx === -1) continue;
+        const key = opt.slice(0, colonIdx).trim();
+        const val = opt.slice(colonIdx + 1).trim();
+        if (key === "value") valueArg = val;
+        if (key === "gas") gasArg = val;
+      }
+      let result = ".call";
+      if (gasArg) result += `.gas(${gasArg})`;
+      if (valueArg) result += `.value(${valueArg})`;
+      result += "(";
+      return result;
+    }
+  );
+}
+
 const REENTRANCY_GUARD_NAMES = new Set([
   "nonReentrant",
   "ReentrancyGuard",
@@ -206,12 +232,34 @@ function isExternalCall(node: unknown): boolean {
   if (!isFunctionCall(node)) return false;
   const fc = node as FunctionCall;
   const expr = fc.expression;
-
-  if (isMemberAccess(expr, "call") || isMemberAccess(expr, "delegatecall") || isMemberAccess(expr, "staticcall")) {
+  // Direct member access
+  if (
+    isMemberAccess(expr, "call") ||
+    isMemberAccess(expr, "delegatecall") ||
+    isMemberAccess(expr, "staticcall") ||
+    isMemberAccess(expr, "send") ||
+    isMemberAccess(expr, "transfer")
+  ) {
     return true;
   }
-  if (isMemberAccess(expr, "send") || isMemberAccess(expr, "transfer")) {
-    return true;
+  // Pre-processed call options chain: .call.value(...)(...) or .call.gas(...).value(...)(...)
+  let current: unknown = expr;
+  while (
+    current !== null &&
+    typeof current === "object" &&
+    (current as { type?: string }).type === "MemberAccess"
+  ) {
+    const ma = current as MemberAccess;
+    if (
+      ma.memberName === "call" ||
+      ma.memberName === "delegatecall" ||
+      ma.memberName === "staticcall" ||
+      ma.memberName === "send" ||
+      ma.memberName === "transfer"
+    ) {
+      return true;
+    }
+    current = ma.expression;
   }
   return false;
 }
@@ -228,6 +276,25 @@ function getLowLevelCallName(node: unknown): string | null {
     isMemberAccess(expr, "transfer")
   ) {
     return (expr as MemberAccess).memberName;
+  }
+  // Pre-processed call options chain: .call.value(...)(...) or .call.gas(...).value(...)(...)
+  let current: unknown = expr;
+  while (
+    current !== null &&
+    typeof current === "object" &&
+    (current as { type?: string }).type === "MemberAccess"
+  ) {
+    const ma = current as MemberAccess;
+    if (
+      ma.memberName === "call" ||
+      ma.memberName === "delegatecall" ||
+      ma.memberName === "staticcall" ||
+      ma.memberName === "send" ||
+      ma.memberName === "transfer"
+    ) {
+      return ma.memberName;
+    }
+    current = ma.expression;
   }
   return null;
 }
@@ -518,21 +585,49 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
 
   let ast: ASTNode;
   let usedTolerantParse = false;
+  let usedCallOptionsPreprocess = false;
   try {
     ast = parse(sourceCode, { loc: true, range: true });
   } catch {
-    try {
-      ast = parse(sourceCode, { loc: true, range: true, tolerant: true });
-      usedTolerantParse = true;
-    } catch {
-      return {
-        findings: [],
-        riskLevel: "INSUFFICIENT_DATA",
-        summary: "Unable to parse Solidity source code. Static analysis could not be performed.",
-        limitations: ["Source code contains syntax errors or is not valid Solidity."],
-        positiveSignals: [],
-      };
+    const preprocessed = preprocessCallOptions(sourceCode);
+    if (preprocessed !== sourceCode) {
+      try {
+        ast = parse(preprocessed, { loc: true, range: true });
+        usedCallOptionsPreprocess = true;
+      } catch {
+        try {
+          ast = parse(sourceCode, { loc: true, range: true, tolerant: true });
+          usedTolerantParse = true;
+        } catch {
+          return {
+            findings: [],
+            riskLevel: "INSUFFICIENT_DATA",
+            summary: "Unable to parse Solidity source code. Static analysis could not be performed.",
+            limitations: ["Source code contains syntax errors or is not valid Solidity."],
+            positiveSignals: [],
+          };
+        }
+      }
+    } else {
+      try {
+        ast = parse(sourceCode, { loc: true, range: true, tolerant: true });
+        usedTolerantParse = true;
+      } catch {
+        return {
+          findings: [],
+          riskLevel: "INSUFFICIENT_DATA",
+          summary: "Unable to parse Solidity source code. Static analysis could not be performed.",
+          limitations: ["Source code contains syntax errors or is not valid Solidity."],
+          positiveSignals: [],
+        };
+      }
     }
+  }
+
+  if (usedCallOptionsPreprocess) {
+    limitations.push(
+      "Solidity call options syntax (call{value: ...}) was pre-processed for analysis. Line numbers may be approximate."
+    );
   }
 
   if (usedTolerantParse) {

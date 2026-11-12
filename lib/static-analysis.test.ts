@@ -88,6 +88,25 @@ contract Destructible {
 }
 `;
 
+const reentrancyVulnerableCallOptions = `
+contract VulnerableCallOptions {
+  mapping(address => uint256) public balances;
+
+  function withdraw(uint256 amount) public {
+    msg.sender.call{value: amount}("");
+    balances[msg.sender] = balances[msg.sender] - amount;
+  }
+}
+`;
+
+const uncheckedCallOptions = `
+contract UncheckedCallOptions {
+  function sendFunds(address target) public {
+    target.call{value: 100}("");
+  }
+}
+`;
+
 const malformedSolidity = `
 contract Broken {
   function foo() public {
@@ -138,6 +157,18 @@ describe("static analysis - reentrancy", () => {
     }
   });
 
+  it("detects reentrancy with call{value:} options syntax", () => {
+    const result = analyzeStatically(reentrancyVulnerableCallOptions);
+    const finding = findFinding(result.findings, "REENTRANCY-01");
+    expect(finding).toBeDefined();
+    if (finding) {
+      expect(finding.severity).toBe("HIGH");
+      expect(finding.confidence).toBe("MEDIUM");
+      expect(finding.evidence).toContain(".call");
+    }
+    expect(result.limitations.length).toBeGreaterThan(0);
+  });
+
   it("does not flag checks-effects-interactions safe ordering", () => {
     const result = analyzeStatically(reentrancySafe);
     const finding = findFinding(result.findings, "REENTRANCY-01");
@@ -162,6 +193,17 @@ describe("static analysis - tx.origin", () => {
 describe("static analysis - unchecked low-level calls", () => {
   it("detects unchecked .call()", () => {
     const result = analyzeStatically(uncheckedCall);
+    const finding = findFinding(result.findings, "UNCHECKED_LOWLEVEL-01");
+    expect(finding).toBeDefined();
+    if (finding) {
+      expect(finding.severity).toBe("HIGH");
+      expect(finding.confidence).toBe("HIGH");
+      expect(finding.evidence).toContain(".call");
+    }
+  });
+
+  it("detects unchecked .call{value:} options syntax", () => {
+    const result = analyzeStatically(uncheckedCallOptions);
     const finding = findFinding(result.findings, "UNCHECKED_LOWLEVEL-01");
     expect(finding).toBeDefined();
     if (finding) {

@@ -26,7 +26,7 @@ describe("ScanPage contract scanning", () => {
         headers: { "Content-Type": "application/json" },
       })
     );
-    globalThis.fetch = fetchMock as any;
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
 
     render(<ScanPage />);
 
@@ -59,7 +59,7 @@ describe("ScanPage contract scanning", () => {
         { status: 200, headers: { "Content-Type": "application/json" } }
       )
     );
-    globalThis.fetch = fetchMock as any;
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
 
     render(<ScanPage />);
 
