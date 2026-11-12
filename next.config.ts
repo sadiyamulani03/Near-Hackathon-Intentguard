@@ -5,6 +5,7 @@ const nextConfig: NextConfig = {
   cacheComponents: true,
   partialPrefetching: true,
   turbopack: {
+    root: "/mnt/d/SY/Near Hackathon/intentguard",
     rules: {
       "*.css": {
         loaders: ["@tailwindcss/turbopack"],
