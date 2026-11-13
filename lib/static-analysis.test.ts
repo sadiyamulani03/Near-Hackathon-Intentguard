@@ -411,3 +411,37 @@ contract AchievementManager is AccessControl {
     expect(result.riskLevel).not.toBe("INSUFFICIENT_DATA");
   });
 });
+
+describe("static analysis - ParserTest regression", () => {
+  const parserTestSource = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+contract ParserTest {
+    mapping(address => uint256) public balances;
+
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+    }
+}
+`;
+
+  const noContractSource = `pragma solidity ^0.8.24;
+`;
+
+  it("detects a valid contract and does not report 'no contracts detected'", () => {
+    const result = analyzeStatically(parserTestSource);
+    expect(result.riskLevel).not.toBe("INSUFFICIENT_DATA");
+    expect(result.summary).not.toBe("No Solidity contracts detected in the submitted source code.");
+    expect(result.limitations).not.toContain("No contract definitions were found in the submitted source.");
+    expect(result.riskLevel).toBe("LOW");
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it("returns INSUFFICIENT_DATA when no contract definition is present", () => {
+    const result = analyzeStatically(noContractSource);
+    expect(result.riskLevel).toBe("INSUFFICIENT_DATA");
+    expect(result.summary).toBe("No Solidity contracts detected in the submitted source. Static analysis could not be performed.");
+    expect(result.limitations.some((l) => l.includes("No contract definitions were found in the submitted source."))).toBe(true);
+    expect(result.findings).toHaveLength(0);
+  });
+});

@@ -701,12 +701,14 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
   const contracts = walkAll(ast).filter((n) => n.type === "ContractDefinition") as ContractDefinition[];
 
   if (contracts.length === 0) {
-    positiveSignals.push("No contract definitions found in source.");
+    limitations.push(
+      "No contract definitions were found in the submitted source. Static analysis requires at least one Solidity contract to analyze."
+    );
     return {
       findings: [],
-      riskLevel: "LOW",
-      summary: "No Solidity contracts detected in the submitted source code.",
-      limitations: ["No contract definitions were found to analyze."],
+      riskLevel: "INSUFFICIENT_DATA",
+      summary: "No Solidity contracts detected in the submitted source. Static analysis could not be performed.",
+      limitations,
       positiveSignals,
     };
   }
