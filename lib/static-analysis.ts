@@ -76,6 +76,27 @@ function preprocessCallOptions(source: string): string {
   );
 }
 
+function preprocessNamedMappings(source: string): string {
+  // Convert named mapping syntax mapping(keyType keyName => valueType valueName)
+  // to the parser-supported mapping(keyType => valueType).
+  // E.g. mapping(address learner => uint256 points) -> mapping(address => uint256)
+  return source.replace(
+    /mapping\s*\(\s*([\w\[\]]+)\s+(\w+)\s*=>\s*([\w\[\]]+)\s+(\w+)\s*\)/g,
+    "mapping($1 => $3)"
+  );
+}
+
+function preprocessAbstract(source: string): string {
+  // Solidity 0.8.x allows `abstract contract`; this parser does not.
+  return source.replace(/\babstract\s+contract\b/g, "contract");
+}
+
+function preprocessImmutable(source: string): string {
+  // Solidity 0.8.x allows `immutable` state variables; this parser does not.
+  // Dropping the keyword leaves a valid declaration.
+  return source.replace(/\bimmutable\b/g, "");
+}
+
 const REENTRANCY_GUARD_NAMES = new Set([
   "nonReentrant",
   "ReentrancyGuard",
@@ -98,6 +119,18 @@ function getSnippet(source: string, node: { range?: [number, number] }): string 
   const s = Math.max(0, start - 1);
   const e = Math.min(source.length, end + 1);
   return source.slice(s, e);
+}
+
+function collectParseErrors(ast: ASTNode, into: string[]): void {
+  const errors = (ast as { errors?: unknown }).errors;
+  if (!Array.isArray(errors)) return;
+  for (const e of errors) {
+    const msg =
+      e && typeof e === "object"
+        ? String((e as { message?: unknown }).message ?? e)
+        : String(e);
+    into.push(msg);
+  }
 }
 
 function isIdentifier(node: unknown): node is Identifier {
@@ -585,25 +618,44 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
 
   let ast: ASTNode;
   let usedTolerantParse = false;
-  let usedCallOptionsPreprocess = false;
+  let namedMappingsPreprocessed = false;
+  const parseErrors: string[] = [];
   try {
     ast = parse(sourceCode, { loc: true, range: true });
   } catch {
-    const preprocessed = preprocessCallOptions(sourceCode);
+    let preprocessed = preprocessNamedMappings(sourceCode);
+    namedMappingsPreprocessed = preprocessed !== sourceCode;
+    preprocessed = preprocessAbstract(preprocessed);
+    preprocessed = preprocessImmutable(preprocessed);
+    const withCallOptions = preprocessCallOptions(preprocessed);
+    const callOptionsPreprocessed = withCallOptions !== preprocessed;
+    preprocessed = withCallOptions;
     if (preprocessed !== sourceCode) {
       try {
         ast = parse(preprocessed, { loc: true, range: true });
-        usedCallOptionsPreprocess = true;
+        if (namedMappingsPreprocessed) {
+          limitations.push(
+            "Named mapping syntax was pre-processed for analysis (parameter names removed)."
+          );
+        }
+        if (callOptionsPreprocessed) {
+          limitations.push(
+            "Solidity call options syntax (call{value: ...}) was pre-processed for analysis. Line numbers may be approximate."
+          );
+        }
       } catch {
         try {
           ast = parse(sourceCode, { loc: true, range: true, tolerant: true });
           usedTolerantParse = true;
+          collectParseErrors(ast, parseErrors);
         } catch {
           return {
             findings: [],
             riskLevel: "INSUFFICIENT_DATA",
             summary: "Unable to parse Solidity source code. Static analysis could not be performed.",
-            limitations: ["Source code contains syntax errors or is not valid Solidity."],
+            limitations: [
+              "Source code contains syntax errors or uses unsupported syntax that could not be recovered even in tolerant parse mode.",
+            ],
             positiveSignals: [],
           };
         }
@@ -612,6 +664,7 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
       try {
         ast = parse(sourceCode, { loc: true, range: true, tolerant: true });
         usedTolerantParse = true;
+        collectParseErrors(ast, parseErrors);
       } catch {
         return {
           findings: [],
@@ -624,23 +677,25 @@ export function analyzeStatically(sourceCode: string): StaticAnalysisResult {
     }
   }
 
-  if (usedCallOptionsPreprocess) {
-    limitations.push(
-      "Solidity call options syntax (call{value: ...}) was pre-processed for analysis. Line numbers may be approximate."
-    );
-  }
-
   if (usedTolerantParse) {
     limitations.push(
-      "Parser used tolerant mode: some modern Solidity syntax may not have been fully analyzed. Results may be incomplete.",
+      "Parser used tolerant mode: some modern Solidity syntax may not have been fully analyzed. Results may be incomplete."
     );
-    return {
-      findings: [],
-      riskLevel: "INSUFFICIENT_DATA",
-      summary: "Source code contains syntax errors or uses unsupported syntax. Static analysis may be incomplete.",
-      limitations,
-      positiveSignals: [],
-    };
+    if (parseErrors.length > 0) {
+      limitations.push(
+        `Parser errors encountered during tolerant parse: ${parseErrors.join("; ")}`
+      );
+      // Tolerant mode recovered a partial AST, but real syntax errors remain.
+      // Do not mark incomplete analysis as successful.
+      return {
+        findings: [],
+        riskLevel: "INSUFFICIENT_DATA",
+        summary: "Source code contains syntax errors or uses unsupported syntax. Static analysis could not be performed reliably.",
+        limitations,
+        positiveSignals: [],
+      };
+    }
+    // Tolerant parse recovered cleanly; proceed with analysis on the recovered AST.
   }
 
   const contracts = walkAll(ast).filter((n) => n.type === "ContractDefinition") as ContractDefinition[];

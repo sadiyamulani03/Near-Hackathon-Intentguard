@@ -326,3 +326,88 @@ describe("static analysis - finding structure", () => {
     expect(result.limitations.length).toBeGreaterThan(0);
   });
 });
+
+describe("static analysis - AchievementManager regression", () => {
+  const achievementManagerSimplified = `
+pragma solidity ^0.8.24;
+import "@openzeppelin/contracts/access/AccessControl.sol";
+
+contract AchievementManager is AccessControl {
+  bytes32 public constant ACHIEVER_ROLE = keccak256("ACHIEVER_ROLE");
+  mapping(address => uint256) public learnerPoints;
+
+  constructor() {
+    _grantRole(ACHIEVER_ROLE, msg.sender);
+  }
+
+  function award(address learner, uint256 points) public onlyRole(ACHIEVER_ROLE) {
+    learnerPoints[learner] += points;
+  }
+}
+`;
+
+  const achievementManagerNamedMapping = `
+pragma solidity ^0.8.24;
+import "@openzeppelin/contracts/access/AccessControl.sol";
+
+contract AchievementManager is AccessControl {
+  bytes32 public constant ACHIEVER_ROLE = keccak256("ACHIEVER_ROLE");
+  mapping(address learner => uint256 points) public learnerPoints;
+
+  constructor() {
+    _grantRole(ACHIEVER_ROLE, msg.sender);
+  }
+
+  function award(address learner, uint256 points) public onlyRole(ACHIEVER_ROLE) {
+    learnerPoints[learner] += points;
+  }
+}
+`;
+
+  const achievementManagerVulnerable = `
+pragma solidity ^0.8.24;
+import "@openzeppelin/contracts/access/AccessControl.sol";
+
+contract AchievementManager is AccessControl {
+  bytes32 public constant ACHIEVER_ROLE = keccak256("ACHIEVER_ROLE");
+  mapping(address => uint256) public learnerPoints;
+
+  constructor() {
+    _grantRole(ACHIEVER_ROLE, msg.sender);
+  }
+
+  function award(address learner, uint256 points) public onlyRole(ACHIEVER_ROLE) {
+    msg.sender.call("");
+    learnerPoints[learner] += points;
+  }
+}
+`;
+
+  it("parses the simplified-mapping AchievementManager source successfully", () => {
+    const result = analyzeStatically(achievementManagerSimplified);
+    expect(result.riskLevel).not.toBe("INSUFFICIENT_DATA");
+    expect(result.findings).toHaveLength(0);
+    expect(result.limitations.length).toBeGreaterThan(0);
+  });
+
+  it("parses the named-mapping AchievementManager source via pre-processing", () => {
+    const result = analyzeStatically(achievementManagerNamedMapping);
+    expect(result.riskLevel).not.toBe("INSUFFICIENT_DATA");
+    const namedMappingLimit = result.limitations.some((l) =>
+      l.toLowerCase().includes("named mapping")
+    );
+    expect(namedMappingLimit).toBe(true);
+  });
+
+  it("still detects reentrancy in the AchievementManager source", () => {
+    const result = analyzeStatically(achievementManagerVulnerable);
+    const finding = result.findings.find((f) => f.ruleId === "REENTRANCY-01");
+    expect(finding).toBeDefined();
+    if (finding) {
+      expect(["HIGH", "MEDIUM"]).toContain(finding.severity);
+      expect(finding.evidence).toContain(".call");
+      expect(finding.proof).toContain("award");
+    }
+    expect(result.riskLevel).not.toBe("INSUFFICIENT_DATA");
+  });
+});
